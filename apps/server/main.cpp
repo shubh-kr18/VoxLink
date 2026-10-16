@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -14,12 +15,22 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace {
 
 constexpr int PORT = 5050;
 constexpr std::size_t MAX_LINE_SIZE = 1024;
+constexpr std::size_t MAX_CLIENTS = 32;
 
+struct ClientSlot {
+    std::thread worker;
+    bool in_use = false;
+    bool finished = false;
+};
+
+std::array<ClientSlot, MAX_CLIENTS> clients;
+std::mutex clients_mutex;
 std::mutex log_mutex;
 
 bool send_all(int fd, const std::string& message) {
@@ -34,6 +45,10 @@ bool send_all(int fd, const std::string& message) {
         );
 
         if (result <= 0) {
+            if (result < 0 && errno == EINTR) {
+                continue;
+            }
+
             return false;
         }
 
@@ -56,7 +71,7 @@ std::string process_command(
     input >> command >> channel;
 
     if (command == "ACQUIRE") {
-        if (!(input >> user)) {
+        if (channel.empty() || !(input >> user)) {
             return "ERR invalid_command\n";
         }
 
@@ -99,7 +114,10 @@ std::string process_command(
     if (command == "RELEASE") {
         std::uint64_t token;
 
-        if (!(input >> user >> token)) {
+        if (
+            channel.empty() ||
+            !(input >> user >> token)
+        ) {
             return "ERR invalid_command\n";
         }
 
@@ -123,9 +141,11 @@ std::string process_command(
     return "ERR unknown_command\n";
 }
 
-void handle_client(int client_fd, aura::FloorManager& floor) {
-    // Prevent a disconnected client from terminating the server
-    // through SIGPIPE when send() is called.
+void handle_client(
+    int client_fd,
+    aura::FloorManager& floor,
+    ClientSlot& slot
+) {
     int enabled = 1;
 
     setsockopt(
@@ -200,6 +220,11 @@ void handle_client(int client_fd, aura::FloorManager& floor) {
         std::lock_guard<std::mutex> lock(log_mutex);
         std::cout << "Client disconnected\n";
     }
+
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        slot.finished = true;
+    }
 }
 
 } // namespace
@@ -232,17 +257,25 @@ int main() {
     address.sin_family = AF_INET;
     address.sin_port = htons(PORT);
 
-    inet_pton(
-        AF_INET,
-        "127.0.0.1",
-        &address.sin_addr
-    );
+    if (
+        inet_pton(
+            AF_INET,
+            "127.0.0.1",
+            &address.sin_addr
+        ) != 1
+    ) {
+        std::cerr << "Invalid server address\n";
+        close(server_fd);
+        return 1;
+    }
 
-    if (bind(
-        server_fd,
-        reinterpret_cast<sockaddr*>(&address),
-        sizeof(address)
-    ) < 0) {
+    if (
+        bind(
+            server_fd,
+            reinterpret_cast<sockaddr*>(&address),
+            sizeof(address)
+        ) < 0
+    ) {
         std::cerr << "Bind failed. Is port "
                   << PORT << " already in use?\n";
 
@@ -250,7 +283,7 @@ int main() {
         return 1;
     }
 
-    if (listen(server_fd, 10) < 0) {
+    if (listen(server_fd, 64) < 0) {
         std::cerr << "Listen failed\n";
         close(server_fd);
         return 1;
@@ -275,11 +308,76 @@ int main() {
             continue;
         }
 
-        std::thread(
-            handle_client,
-            client_fd,
-            std::ref(floor)
-        ).detach();
+        int slot_index = -1;
+        std::thread completed_thread;
+
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex);
+
+            // Find a free slot or reclaim a completed worker.
+            for (std::size_t i = 0; i < MAX_CLIENTS; ++i) {
+                if (clients[i].in_use && clients[i].finished) {
+                    completed_thread =
+                        std::move(clients[i].worker);
+
+                    clients[i].in_use = false;
+                    clients[i].finished = false;
+                }
+
+                if (!clients[i].in_use) {
+                    slot_index = static_cast<int>(i);
+                    clients[i].in_use = true;
+                    break;
+                }
+            }
+        }
+
+        // Join outside the mutex so the worker can finish
+        // without blocking on clients_mutex.
+        if (completed_thread.joinable()) {
+            completed_thread.join();
+        }
+
+        if (slot_index == -1) {
+            int enabled = 1;
+
+            setsockopt(
+                client_fd,
+                SOL_SOCKET,
+                SO_NOSIGPIPE,
+                &enabled,
+                sizeof(enabled)
+            );
+
+            send_all(client_fd, "ERR server_busy\n");
+            close(client_fd);
+
+            std::lock_guard<std::mutex> lock(log_mutex);
+            std::cout
+                << "Client rejected: connection limit reached\n";
+
+            continue;
+        }
+
+        try {
+            clients[slot_index].worker = std::thread(
+                handle_client,
+                client_fd,
+                std::ref(floor),
+                std::ref(clients[slot_index])
+            );
+        } catch (const std::exception& error) {
+            {
+                std::lock_guard<std::mutex> lock(clients_mutex);
+                clients[slot_index].in_use = false;
+                clients[slot_index].finished = false;
+            }
+
+            close(client_fd);
+
+            std::cerr << "Failed to start client thread: "
+                      << error.what() << '\n';
+        }
     }
 
     close(server_fd);

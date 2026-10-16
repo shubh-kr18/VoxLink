@@ -119,6 +119,43 @@ class TcpServerTest(unittest.TestCase):
         finally:
             bob_reader.close()
             bob.close()
+    def test_rejects_clients_beyond_limit(self):
+        held_clients = []
+
+        try:
+            # The setUp() method already opened one client.
+            # Open 31 more to fill all 32 slots.
+            for _ in range(31):
+                client = socket.create_connection(
+                    (HOST, PORT), timeout=2
+                )
+                held_clients.append(client)
+
+            time.sleep(0.1)
+
+            # The 33rd connection should be rejected.
+            with socket.create_connection(
+                (HOST, PORT), timeout=2
+            ) as overflow:
+                overflow.settimeout(2)
+                response = b""
+
+                while not response.endswith(b"\n"):
+                    chunk = overflow.recv(128)
+
+                    if not chunk:
+                        break
+
+                    response += chunk
+
+            self.assertEqual(
+                response.decode().strip(),
+                "ERR server_busy",
+            )
+
+        finally:
+            for client in held_clients:
+                client.close()
 
 
 if __name__ == "__main__":
