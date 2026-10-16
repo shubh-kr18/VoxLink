@@ -256,7 +256,7 @@ int main() {
         return 1;
     }
 
-    std::cout << "AURA server listening on "
+    std::cout << "VoxLink server listening on "
               << "127.0.0.1:" << PORT << '\n';
 
     while (true) {

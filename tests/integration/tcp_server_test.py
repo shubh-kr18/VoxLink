@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SERVER = ROOT / "build" / "aura_server"
+SERVER = ROOT / "build" / "VoxLink_server"
 HOST = "127.0.0.1"
 PORT = 5050
 
@@ -26,7 +26,7 @@ class TcpServerTest(unittest.TestCase):
 
         while time.time() < deadline:
             if cls.server.poll() is not None:
-                raise RuntimeError("AURA server exited unexpectedly")
+                raise RuntimeError("VoxLink server exited unexpectedly")
 
             try:
                 with socket.create_connection(
@@ -38,7 +38,7 @@ class TcpServerTest(unittest.TestCase):
         else:
             cls.server.terminate()
             cls.server.wait(timeout=2)
-            raise RuntimeError("AURA server did not start")
+            raise RuntimeError("VoxLink server did not start")
 
     @classmethod
     def tearDownClass(cls):
