@@ -8,7 +8,9 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -25,6 +27,7 @@ constexpr std::size_t MAX_CLIENTS = 32;
 
 struct ClientSlot {
     std::thread worker;
+    int client_fd = -1;
     bool in_use = false;
     bool finished = false;
 };
@@ -32,6 +35,13 @@ struct ClientSlot {
 std::array<ClientSlot, MAX_CLIENTS> clients;
 std::mutex clients_mutex;
 std::mutex log_mutex;
+
+volatile std::sig_atomic_t shutdown_requested = 0;
+
+void handle_shutdown_signal(int signal_number) {
+    (void)signal_number;
+    shutdown_requested = 1;
+}
 
 bool send_all(int fd, const std::string& message) {
     std::size_t sent = 0;
@@ -44,11 +54,11 @@ bool send_all(int fd, const std::string& message) {
             0
         );
 
-        if (result <= 0) {
-            if (result < 0 && errno == EINTR) {
-                continue;
-            }
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
 
+        if (result <= 0) {
             return false;
         }
 
@@ -214,17 +224,37 @@ void handle_client(
         }
     }
 
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+
+        slot.client_fd = -1;
+        slot.finished = true;
+    }
+
     close(client_fd);
 
     {
         std::lock_guard<std::mutex> lock(log_mutex);
         std::cout << "Client disconnected\n";
     }
+}
 
-    {
-        std::lock_guard<std::mutex> lock(clients_mutex);
-        slot.finished = true;
+bool install_signal_handlers() {
+    struct sigaction action {};
+
+    action.sa_handler = handle_shutdown_signal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+
+    if (sigaction(SIGINT, &action, nullptr) < 0) {
+        return false;
     }
+
+    if (sigaction(SIGTERM, &action, nullptr) < 0) {
+        return false;
+    }
+
+    return true;
 }
 
 } // namespace
@@ -289,10 +319,16 @@ int main() {
         return 1;
     }
 
+    if (!install_signal_handlers()) {
+        std::cerr << "Failed to install signal handlers\n";
+        close(server_fd);
+        return 1;
+    }
+
     std::cout << "VoxLink server listening on "
               << "127.0.0.1:" << PORT << '\n';
 
-    while (true) {
+    while (!shutdown_requested) {
         int client_fd = accept(
             server_fd,
             nullptr,
@@ -301,12 +337,35 @@ int main() {
 
         if (client_fd < 0) {
             if (errno == EINTR) {
+                if (shutdown_requested) {
+                    break;
+                }
+
                 continue;
+            }
+
+            if (shutdown_requested) {
+                break;
             }
 
             std::cerr << "Accept failed\n";
             continue;
         }
+
+        if (shutdown_requested) {
+            close(client_fd);
+            break;
+        }
+
+        int enabled = 1;
+
+        setsockopt(
+            client_fd,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            &enabled,
+            sizeof(enabled)
+        );
 
         int slot_index = -1;
         std::thread completed_thread;
@@ -314,7 +373,6 @@ int main() {
         {
             std::lock_guard<std::mutex> lock(clients_mutex);
 
-            // Find a free slot or reclaim a completed worker.
             for (std::size_t i = 0; i < MAX_CLIENTS; ++i) {
                 if (clients[i].in_use && clients[i].finished) {
                     completed_thread =
@@ -322,41 +380,49 @@ int main() {
 
                     clients[i].in_use = false;
                     clients[i].finished = false;
+                    clients[i].client_fd = -1;
                 }
 
                 if (!clients[i].in_use) {
                     slot_index = static_cast<int>(i);
                     clients[i].in_use = true;
+                    clients[i].finished = false;
+                    clients[i].client_fd = -1;
                     break;
                 }
             }
         }
 
-        // Join outside the mutex so the worker can finish
-        // without blocking on clients_mutex.
         if (completed_thread.joinable()) {
             completed_thread.join();
         }
 
+        if (shutdown_requested) {
+            close(client_fd);
+
+            if (slot_index >= 0) {
+                std::lock_guard<std::mutex> lock(clients_mutex);
+                clients[slot_index].in_use = false;
+                clients[slot_index].finished = false;
+                clients[slot_index].client_fd = -1;
+            }
+
+            break;
+        }
+
         if (slot_index == -1) {
-            int enabled = 1;
-
-            setsockopt(
-                client_fd,
-                SOL_SOCKET,
-                SO_NOSIGPIPE,
-                &enabled,
-                sizeof(enabled)
-            );
-
             send_all(client_fd, "ERR server_busy\n");
             close(client_fd);
 
             std::lock_guard<std::mutex> lock(log_mutex);
-            std::cout
-                << "Client rejected: connection limit reached\n";
+            std::cout << "Client rejected: connection limit reached\n";
 
             continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex);
+            clients[slot_index].client_fd = client_fd;
         }
 
         try {
@@ -369,6 +435,8 @@ int main() {
         } catch (const std::exception& error) {
             {
                 std::lock_guard<std::mutex> lock(clients_mutex);
+
+                clients[slot_index].client_fd = -1;
                 clients[slot_index].in_use = false;
                 clients[slot_index].finished = false;
             }
@@ -380,6 +448,29 @@ int main() {
         }
     }
 
+    std::cout << "VoxLink shutting down...\n";
+
     close(server_fd);
+
+    // Interrupt recv() for every client still using a socket.
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+
+        for (auto& slot : clients) {
+            if (slot.in_use && slot.client_fd >= 0) {
+                shutdown(slot.client_fd, SHUT_RDWR);
+            }
+        }
+    }
+
+    // Wait for all worker threads to finish before exiting.
+    for (auto& slot : clients) {
+        if (slot.worker.joinable()) {
+            slot.worker.join();
+        }
+    }
+
+    std::cout << "VoxLink shutdown complete\n";
+
     return 0;
 }

@@ -1,4 +1,3 @@
-
 import socket
 import subprocess
 import time
@@ -14,8 +13,8 @@ PORT = 5050
 
 class TcpServerTest(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
-        cls.server = subprocess.Popen(
+    def start_server(cls):
+        server = subprocess.Popen(
             [str(SERVER)],
             cwd=ROOT,
             stdout=subprocess.DEVNULL,
@@ -25,24 +24,37 @@ class TcpServerTest(unittest.TestCase):
         deadline = time.time() + 5
 
         while time.time() < deadline:
-            if cls.server.poll() is not None:
-                raise RuntimeError("VoxLink server exited unexpectedly")
+            if server.poll() is not None:
+                raise RuntimeError(
+                    "VoxLink server exited unexpectedly"
+                )
 
             try:
                 with socket.create_connection(
                     (HOST, PORT), timeout=0.2
                 ):
-                    break
+                    return server
             except OSError:
                 time.sleep(0.05)
-        else:
-            cls.server.terminate()
-            cls.server.wait(timeout=2)
-            raise RuntimeError("VoxLink server did not start")
+
+        server.terminate()
+
+        try:
+            server.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait()
+
+        raise RuntimeError("VoxLink server did not start")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = cls.start_server()
 
     @classmethod
     def tearDownClass(cls):
-        cls.server.terminate()
+        if cls.server.poll() is None:
+            cls.server.terminate()
 
         try:
             cls.server.wait(timeout=3)
@@ -54,7 +66,9 @@ class TcpServerTest(unittest.TestCase):
         self.client = socket.create_connection(
             (HOST, PORT), timeout=2
         )
-        self.reader = self.client.makefile("r", encoding="utf-8")
+        self.reader = self.client.makefile(
+            "r", encoding="utf-8"
+        )
 
     def tearDown(self):
         self.reader.close()
@@ -96,15 +110,17 @@ class TcpServerTest(unittest.TestCase):
         )
 
     def test_multiple_clients_are_handled_concurrently(self):
-        # Alice acquires the floor and keeps her connection open.
         response = self.command("ACQUIRE concurrent alice")
         self.assertTrue(response.startswith("GRANTED "))
 
-        bob = socket.create_connection((HOST, PORT), timeout=2)
-        bob_reader = bob.makefile("r", encoding="utf-8")
+        bob = socket.create_connection(
+            (HOST, PORT), timeout=2
+        )
+        bob_reader = bob.makefile(
+            "r", encoding="utf-8"
+        )
 
         try:
-            # Bob must get a response while Alice is still connected.
             bob.sendall(b"OWNER concurrent\n")
             self.assertEqual(
                 bob_reader.readline().strip(),
@@ -119,12 +135,12 @@ class TcpServerTest(unittest.TestCase):
         finally:
             bob_reader.close()
             bob.close()
+
     def test_rejects_clients_beyond_limit(self):
         held_clients = []
 
         try:
-            # The setUp() method already opened one client.
-            # Open 31 more to fill all 32 slots.
+            # setUp() already occupies one client slot.
             for _ in range(31):
                 client = socket.create_connection(
                     (HOST, PORT), timeout=2
@@ -133,7 +149,6 @@ class TcpServerTest(unittest.TestCase):
 
             time.sleep(0.1)
 
-            # The 33rd connection should be rejected.
             with socket.create_connection(
                 (HOST, PORT), timeout=2
             ) as overflow:
@@ -156,6 +171,53 @@ class TcpServerTest(unittest.TestCase):
         finally:
             for client in held_clients:
                 client.close()
+
+    def test_shutdown_and_restart(self):
+        idle_client = socket.create_connection(
+            (HOST, PORT), timeout=2
+        )
+
+        try:
+            # SIGTERM should initiate graceful shutdown.
+            self.__class__.server.terminate()
+            self.__class__.server.wait(timeout=3)
+
+            self.assertEqual(
+                self.__class__.server.returncode,
+                0,
+                "Server did not exit cleanly",
+            )
+
+            # The server should close its active client sockets.
+            idle_client.settimeout(2)
+            self.assertEqual(idle_client.recv(1), b"")
+
+        finally:
+            idle_client.close()
+
+        # Start another instance on the same port.
+        self.__class__.server = self.start_server()
+
+        with socket.create_connection(
+            (HOST, PORT), timeout=2
+        ) as client:
+            client.settimeout(2)
+            client.sendall(b"OWNER restarted\n")
+
+            response = b""
+
+            while not response.endswith(b"\n"):
+                chunk = client.recv(128)
+
+                if not chunk:
+                    break
+
+                response += chunk
+
+            self.assertEqual(
+                response.decode().strip(),
+                "OWNER NONE",
+            )
 
 
 if __name__ == "__main__":
