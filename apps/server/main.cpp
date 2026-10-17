@@ -1,3 +1,4 @@
+
 #include "aura/floor_manager.hpp"
 
 #include <arpa/inet.h>
@@ -7,6 +8,7 @@
 
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -122,18 +124,30 @@ std::string process_command(
     }
 
     if (command == "RELEASE") {
-        std::uint64_t token;
+        std::string token_text;
+        std::string extra;
 
         if (
             channel.empty() ||
-            !(input >> user >> token)
+            !(input >> user >> token_text) ||
+            (input >> extra)
         ) {
             return "ERR invalid_command\n";
         }
 
-        std::string extra;
+        std::uint64_t token = 0;
 
-        if (input >> extra) {
+        auto result = std::from_chars(
+            token_text.data(),
+            token_text.data() + token_text.size(),
+            token
+        );
+
+        if (
+            result.ec != std::errc{} ||
+            result.ptr != token_text.data() + token_text.size() ||
+            token == 0
+        ) {
             return "ERR invalid_command\n";
         }
 
@@ -226,7 +240,6 @@ void handle_client(
 
     {
         std::lock_guard<std::mutex> lock(clients_mutex);
-
         slot.client_fd = -1;
         slot.finished = true;
     }
@@ -416,7 +429,6 @@ int main() {
 
             std::lock_guard<std::mutex> lock(log_mutex);
             std::cout << "Client rejected: connection limit reached\n";
-
             continue;
         }
 
@@ -435,7 +447,6 @@ int main() {
         } catch (const std::exception& error) {
             {
                 std::lock_guard<std::mutex> lock(clients_mutex);
-
                 clients[slot_index].client_fd = -1;
                 clients[slot_index].in_use = false;
                 clients[slot_index].finished = false;
@@ -452,7 +463,6 @@ int main() {
 
     close(server_fd);
 
-    // Interrupt recv() for every client still using a socket.
     {
         std::lock_guard<std::mutex> lock(clients_mutex);
 
@@ -463,7 +473,6 @@ int main() {
         }
     }
 
-    // Wait for all worker threads to finish before exiting.
     for (auto& slot : clients) {
         if (slot.worker.joinable()) {
             slot.worker.join();

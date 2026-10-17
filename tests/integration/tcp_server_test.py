@@ -1,3 +1,4 @@
+
 import socket
 import subprocess
 import time
@@ -142,10 +143,11 @@ class TcpServerTest(unittest.TestCase):
         try:
             # setUp() already occupies one client slot.
             for _ in range(31):
-                client = socket.create_connection(
-                    (HOST, PORT), timeout=2
+                held_clients.append(
+                    socket.create_connection(
+                        (HOST, PORT), timeout=2
+                    )
                 )
-                held_clients.append(client)
 
             time.sleep(0.1)
 
@@ -167,10 +169,53 @@ class TcpServerTest(unittest.TestCase):
                 response.decode().strip(),
                 "ERR server_busy",
             )
-
         finally:
             for client in held_clients:
                 client.close()
+
+    def test_rejects_malformed_commands(self):
+        invalid_commands = [
+            ("ACQUIRE", "ERR invalid_command"),
+            ("ACQUIRE channel", "ERR invalid_command"),
+            ("ACQUIRE channel alice extra", "ERR invalid_command"),
+            ("OWNER", "ERR invalid_command"),
+            ("OWNER channel extra", "ERR invalid_command"),
+            ("RELEASE channel alice nope", "ERR invalid_command"),
+            ("RELEASE channel alice 1 extra", "ERR invalid_command"),
+            ("RELEASE channel alice -1", "ERR invalid_command"),
+            (
+                "RELEASE channel alice 18446744073709551616",
+                "ERR invalid_command",
+            ),
+            ("UNKNOWN channel", "ERR unknown_command"),
+        ]
+
+        for command, expected in invalid_commands:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    self.command(command),
+                    expected,
+                )
+
+    def test_rejects_oversized_line(self):
+        self.client.sendall(b"x" * 1025 + b"\n")
+
+        self.assertEqual(
+            self.reader.readline().strip(),
+            "ERR line_too_long",
+        )
+
+    def test_rapid_connect_disconnect(self):
+        for _ in range(40):
+            with socket.create_connection(
+                (HOST, PORT), timeout=2
+            ):
+                pass
+
+        self.assertEqual(
+            self.command("OWNER reconnect"),
+            "OWNER NONE",
+        )
 
     def test_shutdown_and_restart(self):
         idle_client = socket.create_connection(
@@ -178,7 +223,6 @@ class TcpServerTest(unittest.TestCase):
         )
 
         try:
-            # SIGTERM should initiate graceful shutdown.
             self.__class__.server.terminate()
             self.__class__.server.wait(timeout=3)
 
@@ -188,14 +232,11 @@ class TcpServerTest(unittest.TestCase):
                 "Server did not exit cleanly",
             )
 
-            # The server should close its active client sockets.
             idle_client.settimeout(2)
             self.assertEqual(idle_client.recv(1), b"")
-
         finally:
             idle_client.close()
 
-        # Start another instance on the same port.
         self.__class__.server = self.start_server()
 
         with socket.create_connection(
