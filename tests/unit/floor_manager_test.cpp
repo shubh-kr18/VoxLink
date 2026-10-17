@@ -1,4 +1,3 @@
-
 #include "aura/floor_manager.hpp"
 
 #include <atomic>
@@ -16,8 +15,10 @@ int main() {
 
     auto alice = floor.acquire("ece-2", "alice", 5s);
     assert(alice.has_value());
+    assert(alice->user == "alice");
 
     assert(!floor.acquire("ece-2", "bob").has_value());
+    assert(floor.owner("ece-2") == "alice");
 
     auto retry = floor.acquire("ece-2", "alice");
     assert(retry.has_value());
@@ -30,10 +31,11 @@ int main() {
     assert(floor.release("ece-2", "alice", alice->token));
     assert(!floor.owner("ece-2").has_value());
 
-    auto bob = floor.acquire("ece-2", "bob");
+    auto bob = floor.acquire("ece-2", "bob", 5s);
     assert(bob.has_value());
+    assert(bob->user == "bob");
 
-    auto alice_other = floor.acquire("ece-3", "alice");
+    auto alice_other = floor.acquire("ece-3", "alice", 5s);
     assert(alice_other.has_value());
 
     assert(floor.owner("ece-2") == "bob");
@@ -42,36 +44,45 @@ int main() {
     assert(!floor.acquire("", "alice").has_value());
     assert(!floor.acquire("ece-2", "").has_value());
     assert(!floor.acquire("ece-2", "alice", 0ms).has_value());
+    assert(!floor.acquire("ece-2", "alice", -1ms).has_value());
 
     aura::FloorManager expiry_floor;
 
     auto old_grant = expiry_floor.acquire(
-        "expiry-channel", "alice", 30ms);
-
+        "expiry-channel", "alice", 50ms);
     assert(old_grant.has_value());
 
-    std::this_thread::sleep_for(60ms);
+    std::this_thread::sleep_for(100ms);
+
+    assert(!expiry_floor.owner("expiry-channel").has_value());
 
     auto new_grant = expiry_floor.acquire(
         "expiry-channel", "bob", 5s);
-
     assert(new_grant.has_value());
     assert(new_grant->user == "bob");
+    assert(new_grant->token != old_grant->token);
 
     assert(!expiry_floor.release(
         "expiry-channel", "alice", old_grant->token));
-
     assert(expiry_floor.owner("expiry-channel") == "bob");
+
+    assert(!expiry_floor.release(
+        "expiry-channel", "bob", old_grant->token));
+    assert(expiry_floor.owner("expiry-channel") == "bob");
+
+    assert(expiry_floor.release(
+        "expiry-channel", "bob", new_grant->token));
+    assert(!expiry_floor.owner("expiry-channel").has_value());
 
     constexpr int thread_count = 100;
 
     aura::FloorManager contested_floor;
-
     std::atomic<int> ready{0};
     std::atomic<bool> start{false};
     std::atomic<int> successful_grants{0};
 
     std::vector<std::thread> threads;
+    threads.reserve(thread_count);
 
     for (int i = 0; i < thread_count; ++i) {
         threads.emplace_back([&, i]() {
@@ -109,7 +120,6 @@ int main() {
 
     auto current_grant = contested_floor.acquire(
         "busy-channel", *current_owner);
-
     assert(current_grant.has_value());
 
     assert(contested_floor.release(
@@ -119,7 +129,6 @@ int main() {
 
     auto next_grant = contested_floor.acquire(
         "busy-channel", "next-user", 5s);
-
     assert(next_grant.has_value());
     assert(next_grant->user == "next-user");
 
